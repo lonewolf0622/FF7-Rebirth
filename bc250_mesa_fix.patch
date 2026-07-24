@@ -1,0 +1,61 @@
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index cdab81e..4972f68 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -70,7 +70,9 @@ radv_taskmesh_enabled(const struct radv_physical_device *pdev)
+    if (instance->debug_flags & RADV_DEBUG_NO_MESH_SHADER)
+       return false;
+ 
+-   return pdev->use_ngg && !pdev->use_llvm && pdev->info.gfx_level >= GFX10_3 && radv_compute_queue_enabled(pdev);
++   return pdev->use_ngg && !pdev->use_llvm &&
++          (pdev->info.gfx_level >= GFX10_3 || pdev->info.family == CHIP_GFX1013) &&
++          (radv_compute_queue_enabled(pdev) || pdev->info.family == CHIP_GFX1013);
+ }
+ 
+ bool
+@@ -2554,7 +2556,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+ 
+    pdev->emulate_ngg_gs_query_pipeline_stat = pdev->use_ngg && pdev->info.gfx_level < GFX11;
+ 
+-   pdev->emulate_mesh_shader_queries = pdev->info.gfx_level == GFX10_3;
++   pdev->emulate_mesh_shader_queries = pdev->info.gfx_level == GFX10_3 || pdev->info.family == CHIP_GFX1013;
+ 
+    /* Determine the number of threads per wave for all stages. */
+    pdev->cs_wave_size = 64;
+diff --git a/src/amd/vulkan/radv_query.c b/src/amd/vulkan/radv_query.c
+index 5308ba8..05bc587 100644
+--- a/src/amd/vulkan/radv_query.c
++++ b/src/amd/vulkan/radv_query.c
+@@ -410,7 +410,7 @@ radv_get_pipelinestat_query_size(struct radv_device *device)
+     * invocations, it's easier to use the same size as GFX11.
+     */
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+-   unsigned num_results = pdev->info.gfx_level >= GFX10_3 ? 14 : 11;
++   unsigned num_results = pdev->info.gfx_level >= GFX10_3 || pdev->info.family == CHIP_GFX1013 ? 14 : 11;
+    return num_results * 8;
+ }
+ 
+diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+index 1111111..2222222 100644
+--- a/src/amd/vulkan/radv_shader_info.c
++++ b/src/amd/vulkan/radv_shader_info.c
+@@ -405,5 +405,5 @@ static void
+ static void
+ radv_set_vs_output_param(enum amd_gfx_level gfx_level, const struct nir_shader *nir,
+                          const struct radv_graphics_state_key *gfx_state, struct radv_shader_info *info,
+-                         bool export_prim_id, bool export_clip_cull_dists)
++                         bool export_prim_id, bool export_clip_cull_dists, bool is_gfx1013)
+ {
+@@ -419,5 +419,5 @@ radv_set_vs_output_param(enum amd_gfx_level gfx_level, const struct nir_shader
+    */
+    const bool implicit_prim_id_per_prim =
+-      export_prim_id && info->is_ngg && gfx_level >= GFX10_3 && nir->info.stage == MESA_SHADER_VERTEX;
++      export_prim_id && info->is_ngg && (gfx_level >= GFX10_3 || is_gfx1013) && nir->info.stage == MESA_SHADER_VERTEX;
+    const bool implicit_prim_id_per_vertex =
+       export_prim_id && !implicit_prim_id_per_prim &&
+@@ -1393,4 +1393,4 @@ radv_get_pre_rast_output_info(const struct radv_device *device, const struct r
+ 
+    radv_set_vs_output_param(pdev->info.gfx_level, prerast_stage->nir, gfx_state, &prerast_stage->info, ps_prim_id_in,
+-                            ps_clip_dists_in);
++                            ps_clip_dists_in, pdev->info.family == CHIP_GFX1013);
+ }
