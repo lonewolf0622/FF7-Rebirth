@@ -1,4 +1,4 @@
-    Get the patch and repo
+Thanks to Vogar345 i was able to fully get FF7 Rebirth to work on the bc250 with some tweaks.MAKE SURE TO USE LAUNCH COMMANDS
 
 
 git clone https://github.com/lonewolf0622/FF7BC250.git ~/bc250-toolkit
