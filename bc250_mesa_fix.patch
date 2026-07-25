@@ -1,3 +1,17 @@
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index 68b63a7..7f850b7 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -730,6 +726,9 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
+       return false;
+    }
+ 
++   if (info->family == CHIP_GFX1013)
++      info->gfx_level = GFX10_3;
++
+ 
+ #define VCN_IP_VERSION(mj, mn, rv) (((mj) << 16) | ((mn) << 8) | (rv))
+ 
 diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
 index cdab81e..4972f68 100644
 --- a/src/amd/vulkan/radv_physical_device.c
@@ -35,34 +49,3 @@ index 5308ba8..05bc587 100644
     return num_results * 8;
  }
  
-diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
-index dc9c5c8..8bbf28d 100644
---- a/src/amd/vulkan/radv_shader_info.c
-+++ b/src/amd/vulkan/radv_shader_info.c
-@@ -405,7 +405,7 @@ radv_get_output_masks(const struct nir_shader *nir, const struct radv_graphics_s
- static void
- radv_set_vs_output_param(enum amd_gfx_level gfx_level, const struct nir_shader *nir,
-                          const struct radv_graphics_state_key *gfx_state, struct radv_shader_info *info,
--                         bool export_prim_id, bool export_clip_cull_dists)
-+                         bool export_prim_id, bool export_clip_cull_dists, bool is_gfx1013)
- {
-    struct radv_vs_output_info *outinfo = &info->outinfo;
-    uint64_t per_vtx_mask, per_prim_mask;
-@@ -418,7 +418,7 @@ radv_set_vs_output_param(enum amd_gfx_level gfx_level, const struct nir_shader *
-     * it can be configured as either a per-vertex or per-primitive output depending on the GPU.
-     */
-    const bool implicit_prim_id_per_prim =
--      export_prim_id && info->is_ngg && gfx_level >= GFX10_3 && nir->info.stage == MESA_SHADER_VERTEX;
-+      export_prim_id && info->is_ngg && (gfx_level >= GFX10_3 || is_gfx1013) && nir->info.stage == MESA_SHADER_VERTEX;
-    const bool implicit_prim_id_per_vertex =
-       export_prim_id && !implicit_prim_id_per_prim &&
-       (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_TESS_EVAL);
-@@ -1392,7 +1392,7 @@ radv_link_shaders_info(struct radv_device *device, struct radv_shader_stage *sta
-       const bool ps_clip_dists_in = !fs_stage || !!fs_stage->info.ps.input_clips_culls_mask;
- 
-       radv_set_vs_output_param(pdev->info.gfx_level, prerast_stage->nir, gfx_state, &prerast_stage->info, ps_prim_id_in,
--                               ps_clip_dists_in);
-+                               ps_clip_dists_in, pdev->info.family == CHIP_GFX1013);
-    }
- 
-    if (prerast_stage && !ms_stage) {
