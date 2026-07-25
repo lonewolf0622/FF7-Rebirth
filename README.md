@@ -30,6 +30,21 @@ exactly as written, one at a time, and press Enter after each one.
 If a command asks for your password, type it and press Enter (the
 password won't show as you type - that's normal, not a bug).
 
+**If your terminal uses `fish` shell** (CachyOS and some other distros
+default to this), some of the commands below won't work as-is - fish
+uses different syntax for variables. To avoid this entirely, type
+`bash` first and press Enter before starting any of the steps below:
+
+```bash
+bash
+```
+
+You'll know it worked if your prompt changes slightly. Everything
+after that will run in bash instead, and every command in this guide
+will work exactly as written. (If you're not sure which shell you
+have, just run `bash` anyway - it's harmless even if you didn't need
+it.)
+
 This whole process takes 20-40 minutes, mostly waiting for one long
 step (the build).
 
