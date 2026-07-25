@@ -1,127 +1,122 @@
-# FF7 Rebirth on AMD BC-250 (CachyOS)
+# BC-250 Mesh Shader Patch (GFX1013)
 
-A guide for getting **Final Fantasy VII Rebirth** fully functional on the **AMD BC-250** APU running **CachyOS** using a custom patched Mesa/RADV Vulkan driver.
+Enables mesh shader support (required by Final Fantasy VII Rebirth and
+other DX12 Ultimate titles) on the AMD BC-250. Without this, these
+games refuse to launch at all with a "DX12 not supported" error.
 
-> **Credits:** Special thanks to **Vogar345** for the original fix and tweaks!
+## What this does
 
----
+Forces `gfx_level` to report as GFX10_3 specifically for GFX1013
+(your BC-250's real chip identity stays truthful everywhere else -
+`family` is never changed, only the feature-tier value used for
+capability checks). This unlocks mesh shaders, which genuinely exist
+on this hardware but aren't enabled by default in Mesa.
 
-## ⚠️ Important
-**Make sure to set the Steam Launch Options** at the bottom of this guide after completing the build steps, or the game will not use the modified driver.
+Mesa's own existing safety check for this chip's known compute queue
+issue is left completely untouched, so the compute queue disables
+itself automatically - no extra runtime flag needed for that.
 
----
+## Requirements
 
-## 🛠️ Step-by-Step Setup
-
-### 1. Clone the Repository
-Clone the toolkit repository (or navigate to it if you already downloaded it):
-
-```bash
-git clone [https://github.com/lonewolf0622/FF7BC250.git](https://github.com/lonewolf0622/FF7BC250.git) ~/bc250-toolkit
-cd ~/bc250-toolkit
-```
-> **Note:** If you already downloaded this to a different location (e.g., `~/Downloads/Bc250-radeon-patch-main`), adjust your directory path accordingly.
-
----
-
-### 2. Install Build Dependencies
-Install the required dependencies via Arch/CachyOS package manager:
+- Arch-based distro (CachyOS, etc.) or anything with `pacman`/build
+  tools available. Adapt package names for other distros.
+- `git`, `python3`, `ninja`, `python-mako`, `python-yaml`
 
 ```bash
-sudo pacman -S ninja python-mako python-yaml
+sudo pacman -S --needed git python-mako python-yaml ninja base-devel
 ```
 
----
-
-### 3. Run the Mesa Builder Script
-Start the build script to clone Mesa:
+## Build instructions
 
 ```bash
-bash build-bc250-mesa.sh
+mkdir -p ~/bc250-mesa-build && cd ~/bc250-mesa-build
+git clone --depth 1 --branch mesa-26.1.4 https://gitlab.freedesktop.org/mesa/mesa.git mesa
+cd mesa
+patch -p1 --fuzz=5 -i /path/to/bc250_mesa_fix.patch
 ```
 
-Let the script clone Mesa (tag `mesa-26.1.4`) until it reaches the patch step. If it fails to apply the patch automatically (`patch does not apply`), proceed to apply it manually in the next step.
+If any hunks report `FAILED`, check the `.rej` file it creates - the
+line numbers can drift slightly between Mesa versions. The context
+around each change is unique enough that manually applying the
+few-line difference shown in the `.rej` file is straightforward.
 
----
-
-### 4. Apply the Patch Manually
-Apply the patch manually using fuzzy matching:
+Set up a Python virtual environment for Meson:
 
 ```bash
-cd ~/bc250-mesa-build/mesa
-patch -p1 --fuzz 5 -i ~/Downloads/bc250_mesa_fix.patch
+python3 -m venv venv
+venv/bin/pip install meson
 ```
 
-**Expected output:**
-```text
-patching file src/amd/common/ac_gpu_info.c
-patching file src/amd/vulkan/radv_physical_device.c
-patching file src/amd/vulkan/radv_query.c
-```
-*(Verify there are no `.rej` / rejected hunk errors before continuing.)*
-
----
-
-### 5. Build the Driver
-Clean up any old build files and compile `libvulkan_radeon.so`:
+Build:
 
 ```bash
-cd ~/bc250-mesa-build/mesa
-rm -rf build
-
-VENV="$HOME/bc250-mesa-build/venv"
-PYTHONPATH="$VENV/lib/python3./site-packages" "$VENV/bin/meson" setup build \
+VENV="$HOME/bc250-mesa-build/mesa/venv"
+PYTHONPATH="$VENV/lib/python3"*/site-packages "$VENV/bin/meson" setup build \
   -Dvulkan-drivers=amd -Dgallium-drivers=zink \
   -Dglx=disabled -Degl=disabled -Dgles2=disabled \
   -Dshared-llvm=disabled -Dllvm=disabled \
   -Dxmlconfig=disabled -Dlmsensors=disabled -Dvalgrind=disabled
 
-PYTHONPATH="$VENV/lib/python3./site-packages" ninja -C build src/amd/vulkan/libvulkan_radeon.so
+PYTHONPATH="$VENV/lib/python3"*/site-packages ninja -C build src/amd/vulkan/libvulkan_radeon.so
 ```
 
----
+This step (`ninja`) is the long one - expect 10-30+ minutes depending
+on your CPU.
 
-### 6. Install the Modded Driver
-Copy the built library to your system's library folder:
+## Install
 
 ```bash
 sudo cp build/src/amd/vulkan/libvulkan_radeon.so /usr/lib/libvulkan_radeon_modded.so
 ```
 
----
-
-### 7. Create the Vulkan ICD File
-Create a custom ICD manifest pointing to your modded Vulkan library:
+Create a Vulkan ICD file so the system knows how to find this driver
+without replacing your default one:
 
 ```bash
 cat > ~/radeon_modded_icd.x86_64.json << 'EOF'
 {
-    "file_format_version": "1.0.0",
-    "ICD": {
-        "library_path": "/usr/lib/libvulkan_radeon_modded.so",
-        "api_version": "1.4.309"
-    }
+  "file_format_version": "1.0.0",
+  "ICD": {
+    "library_path": "/usr/lib/libvulkan_radeon_modded.so",
+    "api_version": "1.4.309"
+  }
 }
 EOF
 ```
 
----
-
-### 8. Sanity Check
-Verify that Vulkan info can read the newly generated ICD file:
+## Verify it worked
 
 ```bash
-VK_ICD_FILENAMES=~/radeon_modded_icd.x86_64.json vulkaninfo | head -30
+VK_ICD_FILENAMES=~/radeon_modded_icd.x86_64.json vulkaninfo | grep -i "deviceName\|meshShader ="
 ```
 
----
+You should see your BC-250 listed, along with `meshShader = true`.
 
-## 🎮 Steam Launch Options
+## Usage
 
-Right-click **Final Fantasy VII Rebirth** in Steam → **Properties** → **General** → **Launch Options**, and paste:
+Add this to the game's Steam launch options:
 
-```bash
-VK_ICD_FILENAMES=/home/YOUR_USERNAME/radeon_modded_icd.x86_64.json %command%
+```
+RADV_DEBUG=nodcc VK_ICD_FILENAMES=/home/YOURUSER/radeon_modded_icd.x86_64.json %command%
 ```
 
-> ⚠️ Replace `YOUR_USERNAME` in the path above with your actual system username (e.g., `/home/deck/...` if using a Steam Deck profile).
+Replace `YOURUSER` with your actual username. `nodcc` works around a
+DCC (Delta Color Compression) texture corruption bug on this chip -
+it's required for correct visuals.
+
+## Known limitations
+
+- Async compute is unavailable on this chip due to a genuine,
+  documented hardware bug (Mesa's own source has a comment noting
+  this) - not something this patch can fix.
+- Some other DX12 Ultimate features (hardware ray tracing, VRS) are
+  untested with this patch and may have their own issues.
+- This patch is specific to GFX1013 (BC-250) only - it has no effect
+  on any other GPU and is safe to use as a general daily driver.
+
+## Credit
+
+Builds on the original BC-250 mesh shader patch concept from the
+BC-250 community. See also the community documentation at
+https://elektricm.github.io/amd-bc250-docs/ for broader BC-250 setup
+help (kernel config, BIOS/VRAM settings, etc.).
