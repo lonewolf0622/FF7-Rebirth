@@ -1,0 +1,702 @@
+From 848dc9c55e37163ae05e8860bf8ddf6580ddb4c5 Mon Sep 17 00:00:00 2001
+From: BC250 Mesh Backend <bc250@example.invalid>
+Date: Mon, 3 Aug 2026 19:24:31 +0000
+Subject: [PATCH] radv: add GFX1013 selective mesh backend v3
+
+---
+ docs/drivers/radv/bc250-mesh.rst      | 17 ++++++
+ src/amd/vulkan/radv_cmd_buffer.c      | 68 +++++++++++++++++++----
+ src/amd/vulkan/radv_device.c          |  2 +
+ src/amd/vulkan/radv_device.h          |  3 +-
+ src/amd/vulkan/radv_physical_device.c | 57 +++++++++++++++----
+ src/amd/vulkan/radv_physical_device.h | 32 +++++++++++
+ src/amd/vulkan/radv_query.c           |  2 +-
+ src/amd/vulkan/radv_shader.c          | 79 +++++++++++++++------------
+ src/amd/vulkan/radv_shader_args.c     |  4 +-
+ src/amd/vulkan/radv_shader_info.c     |  9 ++-
+ 10 files changed, 208 insertions(+), 65 deletions(-)
+ create mode 100644 docs/drivers/radv/bc250-mesh.rst
+
+diff --git a/docs/drivers/radv/bc250-mesh.rst b/docs/drivers/radv/bc250-mesh.rst
+new file mode 100644
+index 0000000..2a50d8a
+--- /dev/null
++++ b/docs/drivers/radv/bc250-mesh.rst
+@@ -0,0 +1,17 @@
++BC-250 mesh shader compatibility
++================================
++
++GFX1013 remains a native GFX10 device for ordinary rendering. RADV enables a
++mesh-only compatibility policy by default on this ASIC: true mesh shader
++stages are compiled with GFX10.3 semantics, while vertex, tessellation,
++geometry, fragment, compute, surfaces, synchronization, and VRS retain the
++native device level. Task shaders are not exposed because RADV's native task
++path requires the disabled ACE/compute-only queue.
++
++Set ``RADV_BC250_MESH=0`` to disable the experimental mesh policy. The value
++is captured when the physical device is created and does not change afterward.
++Set ``RADV_BC250_MESH_LOG=1`` to print the selected policy.
++
++The compatibility mode is included in RADV's device cache key, so native GFX10
++and mesh-compatible shader binaries cannot collide. The mode does not modify
++VRS feature reporting or state programming.
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index c8ce81d..3c6b636 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -77,6 +77,27 @@ radv_get_pm4_cs(struct radv_cmd_buffer *cmd_buffer)
+    return cmd_buffer->gang.cs;
+ }
+ 
++/* Return the graphics generation used for draw-time state that belongs to the
++ * currently bound mesh stage.  Ordinary graphics state must continue to use
++ * the physical GFX1013/GFX10 identity.
++ */
++ALWAYS_INLINE static enum amd_gfx_level
++radv_cmd_buffer_mesh_gfx_level(const struct radv_cmd_buffer *cmd_buffer)
++{
++   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   const struct radv_physical_device *pdev = radv_device_physical(device);
++
++   return cmd_buffer->state.shaders[MESA_SHADER_MESH] && radv_bc250_mesh_enabled(pdev) ? GFX10_3
++                                                                                     : pdev->info.gfx_level;
++}
++
++ALWAYS_INLINE static bool
++radv_cmd_buffer_uses_bc250_mesh(const struct radv_cmd_buffer *cmd_buffer)
++{
++   return radv_cmd_buffer_mesh_gfx_level(cmd_buffer) == GFX10_3 &&
++          radv_device_physical(radv_cmd_buffer_device(cmd_buffer))->info.family == CHIP_GFX1013;
++}
++
+ ALWAYS_INLINE static void
+ radv_cmd_set_line_width(struct radv_cmd_buffer *cmd_buffer, float line_width)
+ {
+@@ -3590,8 +3611,12 @@ radv_emit_ps_inputs(struct radv_cmd_buffer *cmd_buffer)
+    num_per_primitive_params += util_bitcount(ps->info.ps.input_per_primitive_mask);
+    input_mask_to_ps_inputs(outinfo, ps, ps->info.ps.input_per_primitive_mask, ps_input_cntl, &ps_offset, per_prim);
+ 
+-   /* Only GFX10.3+ support per-primitive params */
+-   assert(pdev->info.gfx_level >= GFX10_3 || num_per_primitive_params == 0);
++   const bool bc250_mesh_pipeline = cmd_buffer->state.shaders[MESA_SHADER_MESH] && radv_bc250_mesh_enabled(pdev);
++
++   /* GFX1013 uses GFX10.3 per-primitive PS input semantics only for actual
++    * mesh pipelines. Ordinary NGG vertex pipelines retain native GFX10.
++    */
++   assert(pdev->info.gfx_level >= GFX10_3 || bc250_mesh_pipeline || num_per_primitive_params == 0);
+ 
+    radeon_begin(cs);
+ 
+@@ -3599,7 +3624,7 @@ radv_emit_ps_inputs(struct radv_cmd_buffer *cmd_buffer)
+       radeon_opt_set_context_regn(R_028664_SPI_PS_INPUT_CNTL_0, ps_input_cntl, cs->tracked_regs.spi_ps_input_cntl,
+                                   ps_offset);
+    } else {
+-      if (pdev->info.gfx_level == GFX10_3) {
++      if (pdev->info.gfx_level == GFX10_3 || (bc250_mesh_pipeline && num_per_primitive_params)) {
+          /* NUM_INTERP / NUM_PRIM_INTERP separately contain
+           * the number of per-vertex and per-primitive PS input attributes.
+           * These are only exactly known here so couldn't be precomputed.
+@@ -3998,9 +4023,8 @@ radv_emit_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
+    radv_emit_vgt_reuse(cmd_buffer, &vgt_shader_cfg_key);
+    radv_emit_vgt_shader_config(cmd_buffer, &vgt_shader_cfg_key);
+ 
+-   if (pdev->info.gfx_level >= GFX10_3) {
++   if (radv_cmd_buffer_mesh_gfx_level(cmd_buffer) >= GFX10_3)
+       gfx103_emit_vgt_draw_payload_cntl(cmd_buffer);
+-   }
+ }
+ 
+ static void
+@@ -8915,6 +8939,17 @@ radv_bind_fragment_shader(struct radv_cmd_buffer *cmd_buffer, const struct radv_
+ static void
+ radv_bind_task_shader(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *ts)
+ {
++   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   const struct radv_physical_device *pdev = radv_device_physical(device);
++
++   /* Defense in depth: GFX1013 never exposes taskShader. Prevent an invalid
++    * cached or internally-created task stage from reaching gang/ACE setup.
++    */
++   if (pdev->info.family == CHIP_GFX1013) {
++      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_FEATURE_NOT_PRESENT);
++      return;
++   }
++
+    if (!radv_gang_init(cmd_buffer))
+       return;
+ 
+@@ -10912,6 +10947,8 @@ radv_cs_emit_indirect_mesh_draw_packet(struct radv_cmd_buffer *cmd_buffer, uint3
+    bool predicating = cmd_buffer->state.predicating;
+    const bool sqtt_en = !!device->sqtt.bo;
+ 
++   assert(radv_device_physical(radv_cmd_buffer_device(cmd_buffer))->info.gfx_level >= GFX10_3 ||
++          radv_cmd_buffer_uses_bc250_mesh(cmd_buffer));
+    assert(base_reg || (!cmd_buffer->state.uses_drawid && !mesh_shader->info.cs.uses_grid_size));
+ 
+    /* Reset draw state. */
+@@ -11334,6 +11371,9 @@ radv_cs_emit_mesh_dispatch_packet(struct radv_cmd_buffer *cmd_buffer, uint32_t x
+    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    struct radv_cmd_stream *cs = cmd_buffer->cs;
+ 
++   assert(radv_device_physical(radv_cmd_buffer_device(cmd_buffer))->info.gfx_level >= GFX10_3 ||
++          radv_cmd_buffer_uses_bc250_mesh(cmd_buffer));
++
+    radeon_begin(cs);
+    radeon_emit(PKT3(PKT3_DISPATCH_MESH_DIRECT, 3, cmd_buffer->state.predicating));
+    radeon_emit(x);
+@@ -11353,6 +11393,8 @@ radv_emit_direct_mesh_draw_packet(struct radv_cmd_buffer *cmd_buffer, uint32_t x
+    const uint32_t view_mask = cmd_buffer->state.render.view_mask;
+    struct radv_cmd_stream *cs = cmd_buffer->cs;
+ 
++   assert(radv_device_physical(radv_cmd_buffer_device(cmd_buffer))->info.gfx_level >= GFX10_3 ||
++          radv_cmd_buffer_uses_bc250_mesh(cmd_buffer));
+    radv_emit_userdata_mesh(cmd_buffer, x, y, z);
+ 
+    if (pdev->info.mesh_fast_launch_2) {
+@@ -11555,13 +11597,17 @@ radv_get_needed_dynamic_states(struct radv_cmd_buffer *cmd_buffer)
+       if (!cmd_buffer->state.shaders[MESA_SHADER_TESS_CTRL])
+          dynamic_states &= ~(RADV_DYNAMIC_PATCH_CONTROL_POINTS | RADV_DYNAMIC_TESS_DOMAIN_ORIGIN);
+ 
+-      if (pdev->info.gfx_level >= GFX10_3) {
+-         if (cmd_buffer->state.shaders[MESA_SHADER_MESH])
+-            dynamic_states &= ~(RADV_DYNAMIC_VERTEX_INPUT | RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE |
+-                                RADV_DYNAMIC_PRIMITIVE_TOPOLOGY);
+-      } else {
+-         dynamic_states &= ~RADV_DYNAMIC_FRAGMENT_SHADING_RATE;
++      if (cmd_buffer->state.shaders[MESA_SHADER_MESH] &&
++          radv_cmd_buffer_mesh_gfx_level(cmd_buffer) >= GFX10_3) {
++         dynamic_states &= ~(RADV_DYNAMIC_VERTEX_INPUT | RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE |
++                             RADV_DYNAMIC_PRIMITIVE_TOPOLOGY);
+       }
++
++      /* Fragment shading rate remains governed by the physical device.  The
++       * BC-250 mesh override must not enable VRS for ordinary or mesh draws.
++       */
++      if (pdev->info.gfx_level < GFX10_3)
++         dynamic_states &= ~RADV_DYNAMIC_FRAGMENT_SHADING_RATE;
+    }
+ 
+    /* Primitive restart enable is emitted as part of the draw registers. */
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index fa9cfde..a96bea5 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -884,6 +884,8 @@ radv_device_init_cache_key(struct radv_device *device)
+    key->image_2d_view_of_3d = device->vk.enabled_features.image2DViewOf3D && pdev->info.gfx_level == GFX9;
+    key->mesh_shader_queries = device->vk.enabled_features.meshShaderQueries && pdev->emulate_mesh_shader_queries;
+    key->primitives_generated_query = radv_uses_primitives_generated_query(device);
++   key->bc250_mesh_backend_version =
++      radv_bc250_mesh_enabled(pdev) ? RADV_BC250_MESH_BACKEND_VERSION : 0;
+ 
+    /* The Vulkan spec says:
+     *  "Binary shaders retrieved from a physical device with a certain shaderBinaryUUID are
+diff --git a/src/amd/vulkan/radv_device.h b/src/amd/vulkan/radv_device.h
+index 4cd4015..cb96219 100644
+--- a/src/amd/vulkan/radv_device.h
++++ b/src/amd/vulkan/radv_device.h
+@@ -60,8 +60,9 @@ struct radv_device_cache_key {
+    uint32_t image_2d_view_of_3d : 1;
+    uint32_t mesh_shader_queries : 1;
+    uint32_t primitives_generated_query : 1;
++   uint32_t bc250_mesh_backend_version : 2;
+ 
+-   uint32_t reserved : 29;
++   uint32_t reserved : 27;
+ };
+ 
+ enum radv_force_vrs {
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index cdab81e..110fb93 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -62,15 +62,33 @@ radv_perf_query_supported(const struct radv_physical_device *pdev)
+    return pdev->info.gfx_level == GFX10_3 && !(instance->vk.trace_mode & RADV_TRACE_MODE_RGP);
+ }
+ 
++bool
++radv_bc250_mesh_enabled(const struct radv_physical_device *pdev)
++{
++   return pdev->info.family == CHIP_GFX1013 && pdev->bc250_mesh_compat;
++}
++
+ static bool
+-radv_taskmesh_enabled(const struct radv_physical_device *pdev)
++radv_mesh_shader_enabled(const struct radv_physical_device *pdev)
+ {
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
+    if (instance->debug_flags & RADV_DEBUG_NO_MESH_SHADER)
+       return false;
+ 
+-   return pdev->use_ngg && !pdev->use_llvm && pdev->info.gfx_level >= GFX10_3 && radv_compute_queue_enabled(pdev);
++   return pdev->use_ngg && !pdev->use_llvm &&
++          ((pdev->info.gfx_level >= GFX10_3 && radv_compute_queue_enabled(pdev)) ||
++           radv_bc250_mesh_enabled(pdev));
++}
++
++static bool
++radv_task_shader_enabled(const struct radv_physical_device *pdev)
++{
++   if (pdev->info.family == CHIP_GFX1013)
++      return false;
++
++   return radv_mesh_shader_enabled(pdev) && pdev->info.gfx_level >= GFX10_3 &&
++          radv_compute_queue_enabled(pdev);
+ }
+ 
+ bool
+@@ -801,7 +819,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device
+       .EXT_map_memory_placed = true,
+       .EXT_memory_budget = true,
+       .EXT_memory_priority = true,
+-      .EXT_mesh_shader = radv_taskmesh_enabled(pdev),
++      .EXT_mesh_shader = radv_mesh_shader_enabled(pdev),
+       .EXT_multi_draw = true,
+       .EXT_mutable_descriptor_type = true, /* Trivial promotion from VALVE. */
+       .EXT_nested_command_buffer = true,
+@@ -896,7 +914,8 @@ static void
+ radv_physical_device_get_features(const struct radv_physical_device *pdev, struct vk_features *features)
+ {
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
+-   bool taskmesh_en = radv_taskmesh_enabled(pdev);
++   bool mesh_en = radv_mesh_shader_enabled(pdev);
++   bool task_en = radv_task_shader_enabled(pdev);
+    bool has_perf_query = radv_perf_query_supported(pdev);
+    bool has_shader_image_float_minmax = pdev->info.gfx_level != GFX8 && pdev->info.gfx_level != GFX9 &&
+                                         pdev->info.gfx_level != GFX11 && pdev->info.gfx_level != GFX11_5;
+@@ -1248,10 +1267,10 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
+       .minLod = true,
+ 
+       /* VK_EXT_mesh_shader */
+-      .meshShader = taskmesh_en,
+-      .taskShader = taskmesh_en,
+-      .multiviewMeshShader = taskmesh_en,
+-      .primitiveFragmentShadingRateMeshShader = taskmesh_en,
++      .meshShader = mesh_en,
++      .taskShader = task_en,
++      .multiviewMeshShader = mesh_en,
++      .primitiveFragmentShadingRateMeshShader = mesh_en,
+       .meshShaderQueries = false,
+ 
+       /* VK_EXT_depth_clip_control */
+@@ -1646,8 +1665,9 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
+    const bool has_fp16 = radv_shader_fp16_enabled(pdev);
+    const bool enable_sparse = radv_sparse_enabled(pdev);
+ 
+-   VkShaderStageFlags taskmesh_stages =
+-      radv_taskmesh_enabled(pdev) ? VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT : 0;
++   VkShaderStageFlags taskmesh_stages = radv_mesh_shader_enabled(pdev) ? VK_SHADER_STAGE_MESH_BIT_EXT : 0;
++   if (radv_task_shader_enabled(pdev))
++      taskmesh_stages |= VK_SHADER_STAGE_TASK_BIT_EXT;
+    VkShaderStageFlags rt_stages = radv_enable_rt(pdev) ? RADV_RT_STAGE_BITS : 0;
+ 
+    bool accel_dot = pdev->info.compiler_info.has_accelerated_dot_product;
+@@ -2203,7 +2223,7 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
+       .pipelineBinaryCompressedData = false,
+ 
+       /* VK_KHR_compute_shader_derivatives */
+-      .meshAndTaskShaderDerivatives = radv_taskmesh_enabled(pdev),
++      .meshAndTaskShaderDerivatives = radv_task_shader_enabled(pdev),
+ 
+       /* VK_EXT_device_generated_commands */
+       .maxIndirectPipelineCount = 4096,
+@@ -2552,9 +2572,22 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+ 
+    pdev->use_ngg_streamout = pdev->info.gfx_level >= GFX11;
+ 
++   pdev->bc250_mesh_compat =
++      pdev->info.family == CHIP_GFX1013 && pdev->use_ngg && !pdev->use_llvm &&
++      !(instance->debug_flags & RADV_DEBUG_NO_MESH_SHADER) &&
++      debug_get_bool_option("RADV_BC250_MESH", true);
++
++   if (pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("RADV_BC250_MESH_LOG", false))
++      fprintf(stderr, "radv: BC-250 mesh compatibility backend %s (task shaders disabled)\n",
++              pdev->bc250_mesh_compat ? "enabled" : "disabled");
++
+    pdev->emulate_ngg_gs_query_pipeline_stat = pdev->use_ngg && pdev->info.gfx_level < GFX11;
+ 
+-   pdev->emulate_mesh_shader_queries = pdev->info.gfx_level == GFX10_3;
++   pdev->emulate_mesh_shader_queries = pdev->info.gfx_level == GFX10_3 || radv_bc250_mesh_enabled(pdev);
++
++   pdev->mesh_compiler_info = pdev->info.compiler_info;
++   if (radv_bc250_mesh_enabled(pdev))
++      pdev->mesh_compiler_info.gfx_level = GFX10_3;
+ 
+    /* Determine the number of threads per wave for all stages. */
+    pdev->cs_wave_size = 64;
+diff --git a/src/amd/vulkan/radv_physical_device.h b/src/amd/vulkan/radv_physical_device.h
+index 43d0750..141eaf8 100644
+--- a/src/amd/vulkan/radv_physical_device.h
++++ b/src/amd/vulkan/radv_physical_device.h
+@@ -103,6 +103,13 @@ struct radv_physical_device {
+ 
+    struct radeon_winsys *ws;
+    struct radeon_info info;
++
++   /* Compiler capabilities used only by the BC-250 mesh compatibility path.
++    * Hardware capability flags are copied from the real device; only the
++    * generation selector is changed to GFX10.3.
++    */
++   struct ac_compiler_info mesh_compiler_info;
++
+    char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    char marketing_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    uint8_t driver_uuid[VK_UUID_SIZE];
+@@ -147,6 +154,9 @@ struct radv_physical_device {
+    /* Whether to emulate mesh/task shader queries. */
+    bool emulate_mesh_shader_queries;
+ 
++   /* Immutable GFX1013 mesh compatibility policy selected at device probe. */
++   bool bc250_mesh_compat;
++
+    /* Number of threads per wave. */
+    uint8_t ps_wave_size;
+    uint8_t cs_wave_size;
+@@ -303,6 +313,28 @@ bool radv_transfer_queue_enabled(const struct radv_physical_device *pdev);
+ 
+ bool radv_compute_queue_enabled(const struct radv_physical_device *pdev);
+ 
++/* BC-250 (GFX1013) mesh compatibility policy. The physical device remains
++ * GFX10 globally; only true mesh shader stages use GFX10.3 compiler and
++ * graphics semantics. Task shaders remain unsupported because their native
++ * RADV path requires the disabled ACE/compute-only queue.
++ */
++#define RADV_BC250_MESH_BACKEND_VERSION 1u
++
++bool radv_bc250_mesh_enabled(const struct radv_physical_device *pdev);
++
++static inline enum amd_gfx_level
++radv_effective_shader_gfx_level(const struct radv_physical_device *pdev, mesa_shader_stage stage)
++{
++   return stage == MESA_SHADER_MESH && radv_bc250_mesh_enabled(pdev) ? GFX10_3 : pdev->info.gfx_level;
++}
++
++static inline const struct ac_compiler_info *
++radv_effective_shader_compiler_info(const struct radv_physical_device *pdev, mesa_shader_stage stage)
++{
++   return stage == MESA_SHADER_MESH && radv_bc250_mesh_enabled(pdev) ? &pdev->mesh_compiler_info
++                                                                    : &pdev->info.compiler_info;
++}
++
+ bool radv_spm_trace_enabled(const struct radv_physical_device *pdev);
+ 
+ static inline uint32_t
+diff --git a/src/amd/vulkan/radv_query.c b/src/amd/vulkan/radv_query.c
+index 5308ba8..5e77677 100644
+--- a/src/amd/vulkan/radv_query.c
++++ b/src/amd/vulkan/radv_query.c
+@@ -410,7 +410,7 @@ radv_get_pipelinestat_query_size(struct radv_device *device)
+     * invocations, it's easier to use the same size as GFX11.
+     */
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+-   unsigned num_results = pdev->info.gfx_level >= GFX10_3 ? 14 : 11;
++   unsigned num_results = (pdev->info.gfx_level >= GFX10_3 || radv_bc250_mesh_enabled(pdev)) ? 14 : 11;
+    return num_results * 8;
+ }
+ 
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index c6308dd..6f3d3e4 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -58,12 +58,14 @@ static void
+ get_nir_options_for_stage(struct radv_physical_device *pdev, mesa_shader_stage stage)
+ {
+    nir_shader_compiler_options *options = &pdev->nir_options[stage];
++   const enum amd_gfx_level gfx_level = radv_effective_shader_gfx_level(pdev, stage);
++   const struct ac_compiler_info *compiler_info = radv_effective_shader_compiler_info(pdev, stage);
+    const bool split_fma = (stage <= MESA_SHADER_GEOMETRY || stage == MESA_SHADER_MESH) && pdev->cache_key.split_fma;
+ 
+-   ac_nir_set_options(&pdev->info.compiler_info, pdev->use_llvm, options);
++   ac_nir_set_options(compiler_info, pdev->use_llvm, options);
+ 
+-   options->lower_ffma16 = split_fma || pdev->info.gfx_level < GFX9;
+-   options->lower_ffma32 = split_fma || pdev->info.gfx_level < GFX10_3;
++   options->lower_ffma16 = split_fma || gfx_level < GFX9;
++   options->lower_ffma32 = split_fma || gfx_level < GFX10_3;
+    options->lower_ffma64 = split_fma;
+    options->max_unroll_iterations = 32;
+    options->max_unroll_iterations_aggressive = 128;
+@@ -863,7 +865,8 @@ radv_shader_spirv_to_nir(struct radv_device *device, struct radv_shader_stage *s
+         nir->info.stage == MESA_SHADER_MESH) &&
+        nir->info.outputs_written & VARYING_BIT_PRIMITIVE_SHADING_RATE) {
+       /* Lower primitive shading rate to match HW requirements. */
+-      NIR_PASS(_, nir, radv_nir_lower_primitive_shading_rate, pdev->info.gfx_level);
++      const enum amd_gfx_level gfx_level = radv_effective_shader_gfx_level(pdev, nir->info.stage);
++      NIR_PASS(_, nir, radv_nir_lower_primitive_shading_rate, gfx_level);
+    }
+ 
+    /* Indirect lowering must be called after the radv_optimize_nir() loop
+@@ -1805,13 +1808,14 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
+ {
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radv_shader_info *info = &shader->info;
++   const enum amd_gfx_level gfx_level = radv_effective_shader_gfx_level(pdev, info->stage);
+    const struct ac_shader_config *config = &shader->config;
+    struct radv_shader_regs *regs = &shader->regs;
+ 
+    const bool no_pc_export = info->outinfo.param_exports == 0 && info->outinfo.prim_param_exports == 0;
+    const unsigned num_prim_params = info->outinfo.prim_param_exports;
+ 
+-   if (pdev->info.gfx_level >= GFX12) {
++   if (gfx_level >= GFX12) {
+       const unsigned num_params = MAX2(info->outinfo.param_exports, 1);
+ 
+       regs->spi_vs_out_config = S_00B0C4_VS_EXPORT_COUNT(num_params - 1) | S_00B0C4_PRIM_EXPORT_COUNT(num_prim_params) |
+@@ -1832,7 +1836,7 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
+       regs->spi_shader_pgm_rsrc3_gs =
+          ac_apply_cu_en(S_00B21C_CU_EN(cu_mask) | S_00B21C_WAVE_LIMIT(0x3F), C_00B21C_CU_EN, 0, &pdev->info);
+ 
+-      if (pdev->info.gfx_level >= GFX11) {
++      if (gfx_level >= GFX11) {
+          regs->spi_shader_pgm_rsrc4_gs =
+             ac_apply_cu_en(S_00B204_CU_EN_GFX11(0x1) | S_00B204_SPI_SHADER_LATE_ALLOC_GS_GFX10(late_alloc_wave64),
+                            C_00B204_CU_EN_GFX11, 16, &pdev->info);
+@@ -1882,7 +1886,7 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
+       S_02881C_USE_VTX_VIEWPORT_INDX(info->outinfo.writes_viewport_index) |
+       S_02881C_USE_VTX_VRS_RATE(info->outinfo.writes_primitive_shading_rate) |
+       S_02881C_VS_OUT_MISC_VEC_ENA(misc_vec_ena) |
+-      S_02881C_VS_OUT_MISC_SIDE_BUS_ENA(misc_vec_ena || (pdev->info.gfx_level >= GFX10_3 && num_pos_exports > 1)) |
++      S_02881C_VS_OUT_MISC_SIDE_BUS_ENA(misc_vec_ena || (gfx_level >= GFX10_3 && num_pos_exports > 1)) |
+       S_02881C_VS_OUT_CCDIST0_VEC_ENA((total_mask & 0x0f) != 0) |
+       S_02881C_VS_OUT_CCDIST1_VEC_ENA((total_mask & 0xf0) != 0) | total_mask << 8 | clip_dist_mask;
+ 
+@@ -1899,14 +1903,14 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
+    regs->vgt_gs_instance_cnt = S_028B90_CNT(gs_num_invocations) | S_028B90_ENABLE(gs_num_invocations > 1) |
+                                S_028B90_EN_MAX_VERT_OUT_PER_GS_INSTANCE(info->ngg_info.max_vert_out_per_gs_instance);
+ 
+-   if (pdev->info.gfx_level >= GFX11) {
++   if (gfx_level >= GFX11) {
+       /* This should be <= 252 for performance on Gfx11. 256 works too but is slower. */
+-      const uint32_t max_prim_grp_size = pdev->info.gfx_level >= GFX12 ? 256 : 252;
++      const uint32_t max_prim_grp_size = gfx_level >= GFX12 ? 256 : 252;
+ 
+       regs->ngg.ge_cntl = S_03096C_PRIMS_PER_SUBGRP(info->ngg_info.max_gsprims) |
+                           S_03096C_VERTS_PER_SUBGRP(info->ngg_info.hw_max_esverts) |
+                           S_03096C_PRIM_GRP_SIZE_GFX11(max_prim_grp_size) |
+-                          S_03096C_DIS_PG_SIZE_ADJUST_FOR_STRIP(pdev->info.gfx_level >= GFX12);
++                          S_03096C_DIS_PG_SIZE_ADJUST_FOR_STRIP(gfx_level >= GFX12);
+    } else {
+       regs->ngg.ge_cntl = S_03096C_PRIM_GRP_SIZE_GFX10(info->ngg_info.max_gsprims) |
+                           S_03096C_VERT_GRP_SIZE(info->ngg_info.hw_max_esverts);
+@@ -2183,6 +2187,8 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+ {
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
++   const enum amd_gfx_level shader_gfx_level =
++      radv_effective_shader_gfx_level(pdev, binary->info.stage);
+    struct ac_shader_config *config = &binary->config;
+ 
+    if (binary->type == RADV_BINARY_TYPE_RTLD) {
+@@ -2201,7 +2207,7 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+       }
+ 
+       /* Calculate LDS allocation requirements. */
+-      config->lds_size = radv_calculate_lds_size(&binary->info, pdev->info.gfx_level);
++      config->lds_size = radv_calculate_lds_size(&binary->info, shader_gfx_level);
+ 
+       ac_rtld_close(&rtld_binary);
+ #endif
+@@ -2212,7 +2218,7 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+    bool scratch_enabled = config->scratch_bytes_per_wave > 0;
+    const bool trap_enabled = !!device->trap_handler_shader;
+    /* On GFX12, TRAP_PRESENT doesn't exist for compute shaders and it's enabled by default. */
+-   const enum ac_hw_stage hw_stage = radv_select_hw_stage(info, pdev->info.gfx_level);
++   const enum ac_hw_stage hw_stage = radv_select_hw_stage(info, shader_gfx_level);
+    const bool trap_present = trap_enabled && (pdev->info.gfx_level < GFX12 || hw_stage != AC_HW_COMPUTE_SHADER);
+    unsigned vgpr_comp_cnt = 0;
+    unsigned num_input_vgprs = args->ac.num_vgprs_used;
+@@ -2260,7 +2266,7 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+       }
+    }
+ 
+-   if (pdev->info.gfx_level <= GFX10_3 && !pdev->use_ngg_streamout) {
++   if (shader_gfx_level <= GFX10_3 && !pdev->use_ngg_streamout) {
+       config->rsrc2 |= S_00B12C_SO_BASE0_EN(!!info->so.strides[0]) | S_00B12C_SO_BASE1_EN(!!info->so.strides[1]) |
+                        S_00B12C_SO_BASE2_EN(!!info->so.strides[2]) | S_00B12C_SO_BASE3_EN(!!info->so.strides[3]) |
+                        S_00B12C_SO_EN(!!info->so.enabled_stream_buffers_mask);
+@@ -2295,13 +2301,13 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+    }
+ 
+    assert(config->lds_size <= pdev->info.lds_size_per_workgroup);
+-   unsigned lds_alloc = ac_shader_encode_lds_size(config->lds_size, pdev->info.gfx_level, stage);
++   unsigned lds_alloc = ac_shader_encode_lds_size(config->lds_size, shader_gfx_level, stage);
+ 
+    switch (stage) {
+    case MESA_SHADER_TESS_EVAL:
+       if (info->is_ngg) {
+-         if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-            config->rsrc1 |= S_00B228_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++         if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++            config->rsrc1 |= S_00B228_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+          config->rsrc2 |= S_00B22C_OC_LDS_EN(1) | S_00B22C_EXCP_EN(excp_en);
+       } else if (info->tes.as_es) {
+          assert(pdev->info.gfx_level <= GFX8);
+@@ -2312,8 +2318,8 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+          bool enable_prim_id = info->outinfo.export_prim_id || info->uses_prim_id;
+          vgpr_comp_cnt = enable_prim_id ? 3 : 2;
+ 
+-         if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-            config->rsrc1 |= S_00B128_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++         if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++            config->rsrc1 |= S_00B128_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+          config->rsrc2 |= S_00B12C_OC_LDS_EN(1) | S_00B12C_EXCP_EN(excp_en);
+       }
+       config->rsrc2 |= S_00B22C_SHARED_VGPR_CNT(num_shared_vgpr_blocks);
+@@ -2327,7 +2333,7 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+          if (pdev->info.gfx_level >= GFX10) {
+             if (info->vs.needs_instance_id) {
+                vgpr_comp_cnt = pdev->info.gfx_level >= GFX12 ? 1 : 3;
+-            } else if (pdev->info.gfx_level <= GFX10_3) {
++            } else if (shader_gfx_level <= GFX10_3) {
+                vgpr_comp_cnt = 1;
+             }
+             config->rsrc2 |= S_00B42C_EXCP_EN_GFX6(excp_en);
+@@ -2338,15 +2344,15 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+       } else {
+          config->rsrc2 |= S_00B12C_OC_LDS_EN(1) | S_00B12C_EXCP_EN(excp_en);
+       }
+-      if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-         config->rsrc1 |= S_00B428_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++      if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++         config->rsrc1 |= S_00B428_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+       config->rsrc1 |= S_00B428_WGP_MODE(config->wgp_mode);
+       config->rsrc2 |= S_00B42C_SHARED_VGPR_CNT(num_shared_vgpr_blocks);
+       break;
+    case MESA_SHADER_VERTEX:
+       if (info->is_ngg) {
+-         if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-            config->rsrc1 |= S_00B228_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++         if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++            config->rsrc1 |= S_00B228_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+       } else if (info->vs.as_ls) {
+          assert(pdev->info.gfx_level <= GFX8);
+          /* We need at least 2 components for LS.
+@@ -2375,26 +2381,26 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+             vgpr_comp_cnt = 0;
+          }
+ 
+-         if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-            config->rsrc1 |= S_00B128_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++         if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++            config->rsrc1 |= S_00B128_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+       }
+       config->rsrc2 |= S_00B12C_SHARED_VGPR_CNT(num_shared_vgpr_blocks) | S_00B12C_EXCP_EN(excp_en);
+       break;
+    case MESA_SHADER_MESH:
+-      if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-         config->rsrc1 |= S_00B228_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++      if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++         config->rsrc1 |= S_00B228_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+       config->rsrc2 |= S_00B12C_SHARED_VGPR_CNT(num_shared_vgpr_blocks) | S_00B12C_EXCP_EN(excp_en);
+       break;
+    case MESA_SHADER_FRAGMENT:
+-      if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-         config->rsrc1 |= S_00B028_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++      if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++         config->rsrc1 |= S_00B028_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+       config->rsrc1 |= S_00B028_LOAD_PROVOKING_VTX(info->ps.load_provoking_vtx);
+       config->rsrc2 |= S_00B02C_SHARED_VGPR_CNT(num_shared_vgpr_blocks) | S_00B02C_EXCP_EN(excp_en) |
+                        S_00B02C_LOAD_COLLISION_WAVEID(info->ps.pops && pdev->info.gfx_level < GFX11);
+       break;
+    case MESA_SHADER_GEOMETRY:
+-      if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-         config->rsrc1 |= S_00B228_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++      if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++         config->rsrc1 |= S_00B228_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+       config->rsrc2 |= S_00B22C_SHARED_VGPR_CNT(num_shared_vgpr_blocks) | S_00B22C_EXCP_EN(excp_en);
+       break;
+    case MESA_SHADER_RAYGEN:
+@@ -2405,8 +2411,8 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+    case MESA_SHADER_ANY_HIT:
+    case MESA_SHADER_COMPUTE:
+    case MESA_SHADER_TASK:
+-      if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX11_5)
+-         config->rsrc1 |= S_00B848_MEM_ORDERED(radv_mem_ordered(pdev->info.gfx_level));
++      if (shader_gfx_level >= GFX10 && shader_gfx_level <= GFX11_5)
++         config->rsrc1 |= S_00B848_MEM_ORDERED(radv_mem_ordered(shader_gfx_level));
+       config->rsrc1 |= S_00B848_WGP_MODE(config->wgp_mode);
+       config->rsrc2 |= S_00B84C_TGID_X_EN(info->cs.uses_block_id[0]) | S_00B84C_TGID_Y_EN(info->cs.uses_block_id[1]) |
+                        S_00B84C_TGID_Z_EN(info->cs.uses_block_id[2]) |
+@@ -3382,7 +3388,7 @@ shader_compile(struct radv_device *device, struct nir_shader *const *shaders, in
+       struct aco_shader_info ac_info;
+       struct aco_compiler_options ac_opts;
+       radv_aco_convert_opts(&ac_opts, options, args, stage_key);
+-      radv_aco_convert_shader_info(&ac_info, info, args, &device->cache_key, pdev->info.gfx_level);
++      radv_aco_convert_shader_info(&ac_info, info, args, &device->cache_key, options->gfx_level);
+       aco_compile_shader(&ac_opts, &ac_info, shader_count, shaders, &args->ac, &radv_aco_build_shader_binary,
+                          (void **)&binary);
+    }
+@@ -3410,10 +3416,13 @@ radv_shader_nir_to_asm(struct radv_device *device, struct radv_shader_stage *pl_
+    for (unsigned i = 0; i < shader_count; ++i)
+       dump_shader |= radv_can_dump_shader(device, shaders[i]);
+ 
++   const enum amd_gfx_level effective_gfx_level = radv_effective_shader_gfx_level(pdev, stage);
+    struct radv_nir_compiler_options options = {0};
+    radv_fill_nir_compiler_options(&options, device, gfx_state,
+-                                  radv_should_use_wgp_mode(pdev->info.gfx_level, stage, info), dump_shader,
++                                  radv_should_use_wgp_mode(effective_gfx_level, stage, info), dump_shader,
+                                   keep_shader_info, keep_statistic_info);
++   options.gfx_level = effective_gfx_level;
++   options.compiler_info = radv_effective_shader_compiler_info(pdev, stage);
+ 
+    struct radv_shader_binary *binary =
+       shader_compile(device, shaders, shader_count, stage, info, &pl_stage->args, &pl_stage->key, &options);
+diff --git a/src/amd/vulkan/radv_shader_args.c b/src/amd/vulkan/radv_shader_args.c
+index 45920a0..a9085a2 100644
+--- a/src/amd/vulkan/radv_shader_args.c
++++ b/src/amd/vulkan/radv_shader_args.c
+@@ -562,7 +562,7 @@ declare_shader_args(struct radv_shader_args_state *state, const struct radv_devi
+                     mesa_shader_stage stage, mesa_shader_stage previous_stage, struct user_sgpr_info *user_sgpr_info)
+ {
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+-   const enum amd_gfx_level gfx_level = pdev->info.gfx_level;
++   const enum amd_gfx_level gfx_level = radv_effective_shader_gfx_level(pdev, stage);
+    bool has_shader_query = info->has_prim_query || info->has_xfb_query ||
+                            (stage == MESA_SHADER_GEOMETRY && info->gs.has_pipeline_stat_query) ||
+                            (stage == MESA_SHADER_MESH && info->ms.has_query) ||
+@@ -987,7 +987,7 @@ radv_declare_shader_args(const struct radv_device *device, const struct radv_gra
+       }
+ 
+       const struct radv_physical_device *pdev = radv_device_physical(device);
+-      const enum amd_gfx_level gfx_level = pdev->info.gfx_level;
++      const enum amd_gfx_level gfx_level = radv_effective_shader_gfx_level(pdev, stage);
+       uint32_t available_sgprs =
+          gfx_level >= GFX9 && stage != MESA_SHADER_COMPUTE && stage != MESA_SHADER_TASK ? 32 : 16;
+       uint32_t remaining_sgprs = available_sgprs - num_user_sgprs;
+diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+index dc9c5c8..d66e372 100644
+--- a/src/amd/vulkan/radv_shader_info.c
++++ b/src/amd/vulkan/radv_shader_info.c
+@@ -1015,6 +1015,7 @@ radv_nir_shader_info_pass(struct radv_device *device, const struct nir_shader *n
+                           bool consider_force_vrs, struct radv_shader_info *info)
+ {
+    const struct radv_physical_device *pdev = radv_device_physical(device);
++   const enum amd_gfx_level effective_gfx_level = radv_effective_shader_gfx_level(pdev, nir->info.stage);
+    struct nir_function *func = (struct nir_function *)exec_list_get_head_const(&nir->functions);
+ 
+    if (layout->use_dynamic_descriptors) {
+@@ -1082,8 +1083,8 @@ radv_nir_shader_info_pass(struct radv_device *device, const struct nir_shader *n
+          info->cs.block_size[i] = nir->info.workgroup_size[i];
+    }
+ 
+-   info->user_data_0 = radv_get_user_data_0(pdev->info.gfx_level, info);
+-   info->merged_shader_compiled_separately = radv_is_merged_shader_compiled_separately(pdev->info.gfx_level, info);
++   info->user_data_0 = radv_get_user_data_0(effective_gfx_level, info);
++   info->merged_shader_compiled_separately = radv_is_merged_shader_compiled_separately(effective_gfx_level, info);
+    info->force_indirect_descriptors = info->merged_shader_compiled_separately || stage_key->indirect_bindable;
+    info->descriptor_heap = stage_key->descriptor_heap;
+ 
+@@ -1391,7 +1392,9 @@ radv_link_shaders_info(struct radv_device *device, struct radv_shader_stage *sta
+       const bool ps_prim_id_in = !fs_stage || fs_stage->info.ps.prim_id_input;
+       const bool ps_clip_dists_in = !fs_stage || !!fs_stage->info.ps.input_clips_culls_mask;
+ 
+-      radv_set_vs_output_param(pdev->info.gfx_level, prerast_stage->nir, gfx_state, &prerast_stage->info, ps_prim_id_in,
++      const enum amd_gfx_level output_gfx_level =
++         radv_effective_shader_gfx_level(pdev, prerast_stage->nir->info.stage);
++      radv_set_vs_output_param(output_gfx_level, prerast_stage->nir, gfx_state, &prerast_stage->info, ps_prim_id_in,
+                                ps_clip_dists_in);
+    }
+ 
+-- 
+2.47.3
+
